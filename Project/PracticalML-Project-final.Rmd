@@ -1,0 +1,240 @@
+---
+title: "Practical ML"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+# Data preparation
+
+```{r Library loading and initial setup}
+library(ggplot2)
+library(caret)
+library(parallel)
+library(doParallel)
+library(tictoc)
+no_cores <- detectCores() - 1
+set.seed(1234)
+tic()
+```
+
+## Reading data and creating training and testing sets
+```{r}
+pml <- read.csv('pml-training.csv')
+quizz_testing <- read.csv('pml-testing.csv')
+
+train_sample = sample(1:dim(pml)[1],size=dim(pml)[1]*0.7,replace=F)
+training = pml[train_sample,]
+testing = pml[-train_sample,]
+training$classe <- as.factor(training$classe)
+```
+
+The dataset "quizz_testing" doesn't contain column "classe", but contains another column named "problem_id" which will be used for the last quizz of the course. 
+
+## Managing NA values (removing some columns)
+
+```{r}
+count_na_training <- data.frame(cols=colnames(training), count=as.factor(apply(training, 2, function(x) sum(is.na(x)))))
+
+table(count_na_training$count)
+```
+
+67 columns have NA values on 13432 rows. 
+Let's confirm the 13432 NA values are the same for all columns (looks obvious, but it's better to ensure).
+I create a subset of training, named NA_training containing only rows with NA values in one column (max_roll_belt). Then, I apply again the same count on NA values. 
+The result is the same as on the global training data set : 67 columns have 13432 NA rows. 
+So this is the confirmation that 13432 rows have NA values, and other rows are complete.
+
+```{r}
+NA_training <- training[is.na(training$max_roll_belt),]
+
+count_na_training2 <- data.frame(cols=colnames(NA_training), count=as.factor(apply(NA_training, 2, function(x) sum(is.na(x)))))
+
+summary(count_na_training2)
+
+```
+
+
+
+
+If we remove all NA rows, we'll have too few remaining training data. I'll remove NA columns from the dataset instead. 
+First, I check the columns with NA in testing dataset.
+
+```{r}
+count_na_testing <- data.frame(cols=colnames(testing), count=as.factor(apply(testing, 2, function(x) sum(is.na(x)))))
+
+summary(count_na_testing)
+```
+
+Then I remove columns from both datasets.
+I also remove unsused columns and columns containing "DIV/0" values. 
+```{r}
+training2 <- training[,count_na_testing$count==0 & count_na_training$count==0]
+testing2  <- testing[,count_na_testing$count==0 & count_na_training$count==0]
+
+#removing unused variables
+training2 <- training2[,-c(1:7)]
+testing2 <- testing2[,-c(1:7)]
+
+training2 <- training2[, -grep("kurtosis_.", colnames(training2))]
+training2 <- training2[, -grep("skewness_.", colnames(training2))]
+training2 <- training2[, -grep("max_.", colnames(training2))]
+training2 <- training2[, -grep("min_.", colnames(training2))]
+training2 <- training2[, -grep("amplitude_.", colnames(training2))]
+
+testing2 <- testing2[, -grep("kurtosis_.", colnames(testing2))]
+testing2 <- testing2[, -grep("skewness_.", colnames(testing2))]
+testing2 <- testing2[, -grep("max_.", colnames(testing2))]
+testing2 <- testing2[, -grep("min_.", colnames(testing2))]
+testing2 <- testing2[, -grep("amplitude_.", colnames(testing2))]
+```
+
+# Train models
+
+I will run 4 different models : 
+- Random forest
+- Tree (rpart)
+- Bossting
+- Bagging
+
+Then, I will combine these models to try to get the best accuracy of each. 
+
+```{r}
+fitControl <- trainControl(method = "cv", number = 6, allowParallel = TRUE)
+```
+
+## Random forest
+```{r RF}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+tic()
+fit_rf <- train(classe~., data=training2, method="rf", trControl=fitControl)
+toc()
+
+stopCluster(cluster)
+registerDoSEQ()
+
+fit_rf
+```
+
+Accuracy looks very good. 
+
+## Tree
+
+```{r RPART}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitGrid_rpart <- expand.grid(cp=c(0.001, 0.0006, 0.0001, 0.00006))
+
+tic()
+fit_rpart <- train(classe~., data=training2, method="rpart", trControl=fitControl, tuneGrid=fitGrid_rpart)
+toc()
+
+stopCluster(cluster)
+registerDoSEQ()
+
+plot(fit_rpart)
+```
+
+
+## Bagging
+
+```{r TREEBAG}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+tic()
+fit_treebag <- train(classe~., data=training2, method="treebag", trControl=fitControl)
+toc()
+
+stopCluster(cluster)
+registerDoSEQ()
+
+fit_treebag
+```
+
+## Boosting
+
+```{r GBM}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+tic()
+fit_gbm <- train(classe~., data=training2, method="gbm", trControl=fitControl)
+toc()
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+# Cross-Validation
+
+For cross validation, I will use my testing2 dataset, and predict result with each model. 
+Then I will combine prediction through a voting formula and calculate the confusionMatrix of this result. 
+
+```{r Merge of results}
+
+pred_rf <- predict(fit_rf, testing2)
+pred_rpart <- predict(fit_rpart, testing2)
+pred_gbm <- predict(fit_gbm, testing2)
+pred_treebag <- predict(fit_treebag, testing2)
+
+pred_merge <- data.frame(pred_rf, pred_rpart, pred_gbm, pred_treebag, classe=testing2$classe)
+
+pred_merge$nb_A <- (pred_merge$pred_rf=='A') + (pred_merge$pred_rpart=='A') + (pred_merge$pred_gbm=='A') + (pred_merge$pred_treebag=='A')
+pred_merge$nb_B <- (pred_merge$pred_rf=='B') + (pred_merge$pred_rpart=='B') + (pred_merge$pred_gbm=='B') + (pred_merge$pred_treebag=='B')
+pred_merge$nb_C <- (pred_merge$pred_rf=='C') + (pred_merge$pred_rpart=='C') + (pred_merge$pred_gbm=='C') + (pred_merge$pred_treebag=='C')
+pred_merge$nb_D <- (pred_merge$pred_rf=='D') + (pred_merge$pred_rpart=='D') + (pred_merge$pred_gbm=='D') + (pred_merge$pred_treebag=='D')
+pred_merge$nb_E <- (pred_merge$pred_rf=='E') + (pred_merge$pred_rpart=='E') + (pred_merge$pred_gbm=='E') + (pred_merge$pred_treebag=='E')
+
+pred_merge$vote <- 
+    ifelse(pred_merge$nb_A>2,'A',
+           ifelse(pred_merge$nb_B>2,'B',
+                  ifelse(pred_merge$nb_C>2,'C',
+                         ifelse(pred_merge$nb_D>2,'D',
+                                ifelse(pred_merge$nb_E>2,'E',
+                                       ifelse(pred_merge$nb_A==2,'A',
+                                              ifelse(pred_merge$nb_B==2,'B',
+                                                     ifelse(pred_merge$nb_C==2,'C',
+                                                            ifelse(pred_merge$nb_D==2,'D','E')))))))))
+
+confusionMatrix(pred_merge$vote, pred_merge$classe)
+```
+
+# Conclusions
+```{r concl}
+acc_rf_tr <- max(fit_rf$results[,'Accuracy'])
+acc_rpart_tr <- max(fit_rpart$results[,'Accuracy'])
+acc_gbm_tr <- max(fit_gbm$results[,'Accuracy'])
+acc_treebag_tr <- max(fit_treebag$results[,'Accuracy'])
+acc_combo_tr <- NA
+acc_rf_tst <- confusionMatrix(pred_rf, testing2$classe)$overall['Accuracy']
+acc_rpart_tst <- confusionMatrix(pred_rpart, testing2$classe)$overall['Accuracy']
+acc_gbm_tst <- confusionMatrix(pred_gbm, testing2$classe)$overall['Accuracy']
+acc_treebag_tst <- confusionMatrix(pred_gbm, testing2$classe)$overall['Accuracy']
+acc_combo_tst <- confusionMatrix(pred_merge$vote, testing2$classe)$overall['Accuracy']
+
+synthesis <- data.frame(training=c(acc_rf_tr, acc_rpart_tr, acc_gbm_tr, acc_treebag_tr, acc_combo_tr))
+synthesis$testing <- c(acc_rf_tst, acc_rpart_tst, acc_gbm_tst, acc_treebag_tst, acc_combo_tst)
+rownames(synthesis) <- c('Random forest', 'Tree', 'Boosting', 'Bagging', 'Combined')
+
+synthesis
+```
+
+
+I presented here the synthesis of accuracy of all my models, including the crombined model. 
+First think we can see is that we don't have overfitting issue. If we had such issue, we would see a bad accuracy in testing, while here, the accuracy for testing dataset is close the the accuracy of training dataset.
+
+As we can see, the most performant model is the Random Forest. Combo doesn't improve the accuracy, so I decided to keep the Random Forest as a final model, with 99% Accuracy.
+
+```{r quizz}
+quizz_result <- predict(fit_rf, quizz_testing)
+quizz_result <- data.frame(result = quizz_result)
+row.names(quizz_result) <- quizz_testing$problem_id
+toc()
+```
+
+
